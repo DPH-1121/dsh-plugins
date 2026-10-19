@@ -18,7 +18,7 @@
     "  broken      实测不可用（会写清楚坏在哪一步）"
   ],
   "schemaVersion": 2,
-  "updated": "2026-09-27",
+  "updated": "2026-10-19",
   "policy": {
     "peerDependencies": "none",
     "note": "本包不声明任何 dependencies / peerDependencies。dsh 0.1.7 起会在导入插件前核对 peer 里 @deepseek-ai/dsh* 与运行时版本是否一致 —— 写了 peer 就等于把自己钉死在一个版本上。"
@@ -35,6 +35,17 @@
     }
   },
   "runtimes": [
+    {
+      "dshVersion": "0.2.1-rc.2",
+      "channel": "next",
+      "status": "supported",
+      "verifiedAt": "2026-10-19",
+      "verifiedOn": {
+        "os": "Windows",
+        "node": "24.14.0",
+        "result": "隔离 DSH_HOME 中通过官方 0.2.1-rc.2 tarball 安装；host 与 client 半均成功装载，0.2 插件兼容性闸门未跳过本包。"
+      }
+    },
     {
       "dshVersion": "0.1.7-rc.2",
       "channel": "desktop",
@@ -101,7 +112,7 @@
     "dsh 0.1.7 起，导入插件前会核对 peerDependencies 里的 @deepseek-ai/dsh* —— 所以本包一个 peer 都不写。",
     "官方桌面版的安装规格解析器只接受 host/owner/repo 形状（github:owner/repo 或 https://github.com/owner/repo）。仓库子目录会被拒绝（“a URL must point at a git repository or a tarball”），所以插件必须躺在仓库根。",
     "dsh.client 的字段有严格类型校验：platform 必须是字符串，immediately（若写）必须是布尔值，声明了 dsh.client 就必须同时有 exports[\"./client\"]。",
-    "dsh.manifestVersion 与 engines.dsh 目前不被强制检查 —— 所以写错了不会有任何提示，但也不该依赖它们做版本判断。",
+    "dsh 0.2.1 起会把 engines.dsh 作为首选兼容性声明；本包刻意不写 engines.dsh，也不写任何 @deepseek-ai/dsh* peer，因此继续用能力探测而不是版本字符串决定功能。",
     "从 npm 装 0.1.6-alpha.1 / 0.1.5-rc.1 / 0.1.5-rc.2 这类**非该线最新**的版本会解析到更新的同线库，可能装完起不来（见 0.1.6-alpha.1 那一条）。装同线最新版最稳。",
     "客户端半的服务 URL 形状是 /plugins/??<包名>/client.js&rev=<启动图哈希>；启动图（页面 HTML 里的 boot payload）里能直接看到它有没有被登记 —— 排查「装了但界面没出现」时，先看这里。",
     "★ 从「本地路径安装」（link:）换成「从 GitHub 安装」会失败，且桌面版把它显示成「没有写入权限，无法安装」—— 其实不是权限：那一份在 node_modules 里是个 Junction，而 pnpm 用 rename 去覆盖它，Windows 上必然 EPERM（[ERR_PNPM_EPERM] [importPackage ...\\node_modules\\dsh-plugins-market] rename '..._tmp_...' -> '...'）。修法：先卸载旧的那份，或 cmd /c rmdir \"<profile>\\node_modules\\dsh-plugins-market\" 删掉那个链接再重装。必须用 rmdir —— 递归删除有可能顺着链接删掉真正的源码目录。",
