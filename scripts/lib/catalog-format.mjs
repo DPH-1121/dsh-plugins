@@ -35,9 +35,18 @@ export const SNAPSHOT_REL = 'catalog/snapshot.json';
 /** 默认携带完整离线目录，新设备不依赖 GitHub Raw 的可达性。 */
 export const SNAPSHOT_SIZE = Infinity;
 
-/** 来源标识 → 人话，用于界面与索引里的 sources 数组 */
+/**
+ * 来源标识 → 人话，用于界面与索引里的 sources 数组。
+ *
+ * ★ `github-repo` 与 `github-search` 是**两条不同的路**，虽然都直读 GitHub：
+ *   搜索负责「发现新项目」（一次 100 个，但只能看到每个查询的前 1000 条），
+ *   直读负责「把已知项目的 star 数与最近推送刷准」（按 owner/repo 点名，14k 条也能覆盖）。
+ *   只靠搜索的话，落在 1000 条之外的项目永远拿不到新数据 —— 这正是面板上
+ *   「更新于 23 天前」与星数对不上的根因。
+ */
 export const SOURCE_LABELS = {
   'github-search': 'GitHub 搜索',
+  'github-repo': 'GitHub 直读',
   'public-index': '公开索引',
   seed: '手工收录',
 };
@@ -149,9 +158,50 @@ export function normalizeRecord(raw) {
 }
 
 /**
- * 采信顺序：GitHub 搜索（直读仓库，最权威）> 手工收录 > 公开索引（第三方转述）。
+ * GitHub GraphQL 的 `repository` 节点 → 规范记录。
+ *
+ * ★ 为什么不能复用 REST 搜索那条路：两个接口的字段形状**完全不同**
+ *   （`stargazerCount` vs `stargazers_count`、`primaryLanguage.name` vs `language`、
+ *   `repositoryTopics.nodes[].topic.name` vs `topics`），
+ *   而 `normalizeRecord` 只认识 REST 的形状。
+ *
+ * ★ 最要紧的是 `nameWithOwner`：仓库或账号**改名之后**，只有它会告诉我们
+ *   「这个仓库现在叫什么」。旧 id 在 GitHub 上会被重定向，GraphQL 也会照着重定向
+ *   返回规范名 —— 采集器据此把索引里的 id 一起迁过去。没有这一步，面板会一直
+ *   显示改名前的老地址，而 star 数看起来和真人对不上（其实是另一个仓库视图）。
+ *
+ * 拿不到就是 null：GraphQL 没给描述，就写 null，不拿仓库名凑一句。
  */
-const SOURCE_RANK = { 'github-search': 3, seed: 2, 'public-index': 1 };
+export function normalizeGraphqlRepo(node, { sources = ['github-repo'] } = {}) {
+  if (!node || typeof node !== 'object') return null;
+  const topics = (Array.isArray(node.repositoryTopics?.nodes) ? node.repositoryTopics.nodes : [])
+    .map((n) => n?.topic?.name)
+    .filter((t) => typeof t === 'string' && t !== '');
+  const spdx = node.licenseInfo?.spdxId;
+  return normalizeRecord({
+    id: node.nameWithOwner,
+    description: node.description,
+    stars: node.stargazerCount,
+    forks: node.forkCount,
+    language: node.primaryLanguage?.name ?? null,
+    topics,
+    // GitHub 用一个占位 SPDX 表示「有 LICENSE 文件但没有可识别的许可」
+    license: spdx && spdx !== 'NOASSERTION' ? spdx : null,
+    homepage: node.homepageUrl,
+    pushedAt: node.pushedAt,
+    archived: node.isArchived,
+    sources,
+  });
+}
+
+/**
+ * 采信顺序：直读 GitHub（搜索 / 点名）> 手工收录 > 公开索引（第三方转述）。
+ *
+ * ★ `github-repo` 与 `github-search` 并列最高：两者都是 GitHub 自己给的字段，
+ *   没有「谁更可信」的问题。真要分先后，`mergeRecords` 按传入顺序取第一个
+ *   （见它的说明）—— 采集器刻意把「本轮点名直读」放在前面，因为那份最新。
+ */
+const SOURCE_RANK = { 'github-search': 3, 'github-repo': 3, seed: 2, 'public-index': 1 };
 
 /** 一条记录里**最高**的那个来源排名 —— 0 表示来源未知 */
 export function sourceRank(rec) {
@@ -165,8 +215,13 @@ function bestRank(rec) {
 /**
  * 合并同一个仓库的多次采集结果。
  *
- * 字段级取舍：谁的来源排名高就采信谁的非空值。`sources` 取并集 ——
+ * 字段级取舍：谁的来源排名高就采信谁的非空值；**排名相同时采信第一个参数**
+ * （`github-search` 与 `github-repo` 并列最高，采集器会把「本轮刚刚点名直读」
+ * 的那份放在第一个，因为那份最新）。`sources` 取并集 ——
  * 「这条是从哪儿知道的」本身就是要展示的事实。
+ *
+ * ★ `firstSeenAt` 取最早、`lastSyncedAt` 取最新：改名迁移时这条规矩让
+ *   「这个项目第一次被看到」的时间跟着记录一起搬家，而不是从今天重新算。
  */
 export function mergeRecords(a, b) {
   if (!a) return b;

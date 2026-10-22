@@ -7,6 +7,9 @@
  *   node scripts/collect.mjs --only owner/repo# 只处理一个仓库（调试 / 手工补录）
  *   node scripts/collect.mjs --limit 200      # 只保留 star 最高的 N 条（试跑，不写盘）
  *   node scripts/collect.mjs --pages 5        # 每个查询最多翻几页（默认 3 页 = 300 条）
+ *   node scripts/collect.mjs --refresh-all    # 本轮点名直读**全部**仓库（个人 token / 本地补全用）
+ *   node scripts/collect.mjs --refresh-rotation 1
+ *                                             # 排班切成几份（默认 4；1 等同 --refresh-all）
  *
  * ── 三条路径的能力边界（别混）─────────────────────────────────
  *
@@ -15,20 +18,24 @@
  *   --offline  同样不联网，但**会写** catalog/（用缓存里的原始数据重跑一遍归一化）。
  *   （无参数） 联网采集 —— 只有这条路径会发现新项目、更新 star 数与描述。
  *
- * ── 数据从哪来（三路合并）──────────────────────────────────────
+ * ── 数据从哪来（四路合并）──────────────────────────────────────
  *
- *   1. GitHub 搜索            按 topic / 关键词检索，直读仓库元数据（最权威，优先级最高）
- *   2. 公开索引 plugins.json   第三方维护的 DSH 插件索引（覆盖面最广，优先级最低）
- *   3. catalog/seed.json      手工收录 / 手工排除（人工写下的东西优先级高于第三方转述）
+ *   1. GitHub 搜索            按 topic / 关键词检索 —— 负责**发现**新项目
+ *   2. GitHub 直读            按 owner/repo 点名批量取（GraphQL）—— 负责**刷准**已知项目
+ *   3. 公开索引 plugins.json   第三方维护的 DSH 插件索引（覆盖面最广，优先级最低）
+ *   4. catalog/seed.json      手工收录 / 手工排除（人工写下的东西优先级高于第三方转述）
  *
- *   ★ 同一仓库取并集：GitHub 搜索给出的描述 / star 数最准；公开索引覆盖了大量
- *     没打 topic、搜不到的仓库；seed 用来补两者都漏掉的，以及明确排除某些仓库。
+ *   ★ 为什么「搜索」之外还要「直读」：搜索每个查询最多只翻到 1000 条结果，
+ *     一万四千多个仓库里绝大多数落在任何一个切面的头部之外。只靠搜索，它们
+ *     的 star 数与最近推送**永远停在第一次被采集的那天** —— 面板上表现为
+ *     「更新于 23 天前」和明明已经涨了星却还显示旧数字。直读按名字点名，
+ *     没有这个可见性上限；改名也在这里被纠正（GitHub 会返回规范名）。
  *
  * ── 三条硬规矩 ────────────────────────────────────────────────
  *
  *   · **内容没变就不动时间戳**（见 lib/catalog-format.mjs 的说明）。
- *   · **没看过就不删**。某个来源这一轮失败了（限流、网络），那么由它发现、
- *     这一轮又没被别的来源看到的记录**原样保留** —— 把「没查到」当成「不存在」
+ *   · **没看过就不删、也别改**。某个来源这一轮失败了（限流、网络）或按排班
+ *     没轮到某个仓库，由它给出的值**原样保留** —— 把「没查到」当成「不存在」
  *     是这类采集器最容易犯、也最难发现的错误。只有 90 天没再被任何来源看到过的
  *     记录才会被清掉。
  *   · **绝不猜**。描述取不到就 null，star 数取不到就 null。
@@ -41,10 +48,16 @@ import { fileURLToPath } from 'node:url';
 import {
   INDEX_REL, SNAPSHOT_REL, SOURCE_LABELS,
   buildIndex, buildSnapshot, contentEquals, indexContent, mergeRecords,
-  normalizeRecord, readJsonSafe, recordContent, sortRecords, serializeIndex, sourceRank,
+  normalizeGraphqlRepo, normalizeRecord, readJsonSafe, sortRecords, serializeIndex,
   toRepoId, writeTextAtomic,
 } from './lib/catalog-format.mjs';
-import { describeToken, githubToken, searchRepositories } from './lib/github.mjs';
+import {
+  REPO_BATCH_SIZE, describeToken, fetchRepositoryBatch, githubToken, searchRepositories,
+} from './lib/github.mjs';
+import { applyRepoRefresh, reconcile } from './lib/reconcile.mjs';
+import {
+  REFRESH_CONCURRENCY, REFRESH_MIN_POINTS, REFRESH_ROTATION, describeRefreshQueue, planRefreshQueue,
+} from './lib/refresh.mjs';
 
 const HERE = path.dirname(fileURLToPath(import.meta.url));
 const REPO = path.resolve(HERE, '..');
@@ -84,9 +97,6 @@ const RELEVANT_TOPICS = new Set([
 /** 兜底相关性判断：名字 / 描述里出现 dsh 或 deepseek harness 这个词 */
 const RELEVANT_TEXT = /(^|[^a-z0-9])dsh([^a-z0-9]|$)|deepseek[-_ ]?harness/i;
 
-/** 多久没被任何来源看到就从索引里清掉 */
-const STALE_MS = 90 * 24 * 60 * 60 * 1000;
-
 // ─────────────────────────────────────────────────────────────
 // 参数
 // ─────────────────────────────────────────────────────────────
@@ -104,6 +114,17 @@ const ONLY = toRepoId(valueOf('--only'));
 const LIMIT = Number(valueOf('--limit', '0')) || 0;
 const PAGES = Number(valueOf('--pages', '3')) || 3;
 const QUIET = has('--quiet');
+/**
+ * 本轮点名直读的排班。
+ *
+ * 默认切 4 份：CI 里的 `GITHUB_TOKEN` 只有 1,000 点/小时，而一万四千多条全刷一遍
+ * 约 2,700 点 —— 不切份就会被限流打断，切份之后每条记录 24 小时内至少刷到一次。
+ * 个人 token（5,000 点/小时）或本地补数据时用 `--refresh-all` 一次刷完。
+ */
+const REFRESH_ALL = has('--refresh-all');
+const REFRESH_ROTATION_ARG = REFRESH_ALL
+  ? 1
+  : Math.max(1, Math.trunc(Number(valueOf('--refresh-rotation', String(REFRESH_ROTATION))) || REFRESH_ROTATION));
 
 const log = (...a) => { if (!QUIET) console.log(...a); };
 const warn = (...a) => console.warn(...a);
@@ -392,7 +413,154 @@ async function collectFromSeed(include) {
 }
 
 // ─────────────────────────────────────────────────────────────
-// 合并 + 时间戳
+// 来源 ④：GitHub 直读（点名批量刷新）
+// ─────────────────────────────────────────────────────────────
+
+/**
+ * 按 owner/repo 点名，把**已知项目**的公开事实刷一遍。
+ *
+ * 与「GitHub 搜索」的分工：搜索负责**发现**（每个查询只有前 1000 条可见），
+ * 这里负责**刷准**（点名就没有可见性上限）。面板上 star 数对不上、更新日期
+ * 停在很久以前，根因就是这部分记录从来没人再看它们一眼。
+ *
+ * 配额账（实测）：一次请求 100 个仓库，GitHub 报的 `rateLimit.cost` 是 1 点，
+ * 一万五千多条 = 约 152 次请求。CI 的 `GITHUB_TOKEN` 是 1,000 点/小时，
+ * 所以默认每轮全刷；并发 4 把耗时压到几分钟。以下三条是保险：
+ *
+ *   · **配额见底就收手**：剩余点数低于 `REFRESH_MIN_POINTS` 就停下，
+ *     这一轮没刷到的记录按「没看过」处理 —— 保持上一轮的值，不删。
+ *   · **目录继续长大时可以分片**（`--refresh-rotation N`）：每轮刷 1/N，
+ *     按时间窗轮转，不需要落盘游标。
+ *   · **改名迁移**：GitHub 会为重定向后的旧 id 返回规范名；旧 id 的记录并到新 id 上，
+ *     而不是留下一条永远停在旧名字的记录。
+ *
+ * @returns {{kind:string,label:string,url:string,records:Map,renamed:Map,
+ *            missing:Set,covered:Set,skipped:Set,planned:number,
+ *            failed:boolean,partial:boolean,error:string|null}}
+ */
+async function collectFromGithubRepos(ids, { token, priority = [], rotation = REFRESH_ROTATION_ARG } = {}) {
+  const kind = 'github-repo';
+  const label = SOURCE_LABELS[kind];
+  const url = 'https://github.com';
+
+  const all = new Set(ids);
+  const queue = planRefreshQueue(all, { rotation, priority });
+  const base = {
+    kind, label, url,
+    records: new Map(), renamed: new Map(), missing: new Set(),
+    covered: new Set(), checked: new Set(), skipped: new Set(all), planned: queue.length,
+    failed: false, partial: false, error: null,
+  };
+
+  if (queue.length === 0) {
+    return { ...base, skipped: new Set(), partial: false };
+  }
+  if (!token) {
+    warn('  ! 没有 GitHub token：跳过点名直读（GraphQL 不支持匿名），旧值原样保留');
+    return { ...base, skipped: new Set(), failed: true, error: '没有 GitHub token，本轮没有直读任何仓库' };
+  }
+
+  log(`→ GitHub 直读 ${describeRefreshQueue(queue, all.size, { rotation })}`);
+
+  const batches = [];
+  for (let i = 0; i < queue.length; i += REPO_BATCH_SIZE) batches.push(queue.slice(i, i + REPO_BATCH_SIZE));
+
+  const startedAt = Date.now();
+  let cursor = 0;
+  let completed = 0;
+  let stopReason = null;      // 'limit' | 'error' | 'budget'
+  let hardError = null;
+
+  /** 把一批结果并进候选集（顺序无关：按 id 落 Map，最终排序在写盘前统一做） */
+  const absorb = (res) => {
+    for (const [requestedId, node] of res.nodes) {
+      const rec = normalizeGraphqlRepo(node);
+      if (!rec) continue;
+      if (rec.id !== requestedId) base.renamed.set(requestedId, rec.id);
+      const prev = base.records.get(rec.id);
+      base.records.set(rec.id, prev ? mergeRecords(prev, rec) : rec);
+      base.covered.add(requestedId);
+      base.checked.add(requestedId);
+      base.skipped.delete(requestedId);
+      // 规范名也算「看过」：改名后旧 id 与规范 id 都不该再被当成没看过
+      base.covered.add(rec.id);
+      base.skipped.delete(rec.id);
+    }
+    for (const id of res.missing) {
+      // 看过它了，只是它不在了 —— 不算「没刷到」，但也不产出新记录
+      base.covered.add(id);
+      base.checked.add(id);
+      base.skipped.delete(id);
+      base.missing.add(id);
+    }
+  };
+
+  async function worker() {
+    for (;;) {
+      if (stopReason) return;
+      const index = cursor;
+      cursor += 1;
+      if (index >= batches.length) return;
+
+      const res = await fetchRepositoryBatch(batches[index], { token });
+
+      /*
+       * ★ 「配额用尽 / 网络挂了」与「这一批里有仓库被删了」必须分开：
+       *   前者要停下来保命，后者是正常信息。`fetchRepositoryBatch` 已经把
+       *   NOT_FOUND 与其它错误分开返回了。
+       */
+      if (res.rateLimited) {
+        stopReason = 'limit';
+        hardError = res.error;
+        continue;
+      }
+      if (res.error && res.nodes.size === 0 && res.missing.size === 0) {
+        stopReason = 'error';
+        hardError = res.error;
+        continue;
+      }
+
+      absorb(res);
+      completed += 1;
+      if (res.error) warn(`  ! 直读有错误（继续）：${res.error}`);
+      if (completed % 20 === 0 || completed === batches.length) {
+        log(`   直读 ${completed}/${batches.length} 批 · ${base.records.size} 个仓库 · ${((Date.now() - startedAt) / 1000).toFixed(0)}s`);
+      }
+
+      if (res.rateLimit && typeof res.rateLimit.remaining === 'number' && res.rateLimit.remaining < REFRESH_MIN_POINTS) {
+        stopReason = 'budget';
+        continue;
+      }
+    }
+  }
+
+  const workers = Math.min(REFRESH_CONCURRENCY, batches.length);
+  await Promise.all(Array.from({ length: workers }, () => worker()));
+
+  if (stopReason === 'limit' || stopReason === 'budget') {
+    warn(`  ! ${stopReason === 'limit' ? hardError : '配额见底'} —— 本轮直读提前收手，没刷到的记录保留上一轮的值`);
+  }
+
+  const took = ((Date.now() - startedAt) / 1000).toFixed(0);
+  const missingNote = base.missing.size > 0 ? `，另有 ${base.missing.size} 个仓库在 GitHub 上已不存在` : '';
+  const renameNote = base.renamed.size > 0 ? `，${base.renamed.size} 个仓库已改名（索引 id 已跟着改）` : '';
+  ok(`GitHub 直读：${base.records.size} 个仓库（${took}s${missingNote}${renameNote}）`);
+
+  // 一批都没成功 = 这一路整轮失败；部分成功只是「不完整」，由 skipped 兜住
+  if (hardError && base.records.size === 0) {
+    warn(`  ! 直读中断：${hardError} —— 没刷到的记录保留上一轮的值`);
+    return { ...base, failed: true, partial: true, error: hardError };
+  }
+
+  if (stopReason === 'limit' || stopReason === 'budget' || stopReason === 'error' || base.skipped.size > 0) {
+    base.partial = true;
+    if (!base.error) base.error = hardError ?? null;
+  }
+  return base;
+}
+
+// ─────────────────────────────────────────────────────────────
+// 合并
 // ─────────────────────────────────────────────────────────────
 
 function mergeAll(sources) {
@@ -406,114 +574,34 @@ function mergeAll(sources) {
   return merged;
 }
 
-/**
- * 套用「内容没变就不动时间戳」与「没看过就不删」两条规矩。
- *
- * @param {boolean} [opts.keepAll] `--only` 专用：这一轮只看了**一个**仓库，
- *   其余记录根本没被看过，所以一律原样保留 —— 哪怕它已经很旧。
- *   否则一条「只补录一个仓库」的调试命令会顺手把几百条陈旧记录清掉。
- * @returns {{records:object[], stats:{added:number,updated:number,kept:number,removed:number,unseen:number}}}
- */
-/** 会被来源影响、因而需要「接住上一轮」的字段 */
-const CARRY_FIELDS = [
-  'description', 'descriptionZh', 'stars', 'forks',
-  'language', 'topics', 'license', 'homepage', 'pushedAt',
-];
-
-/**
- * 某个来源这一轮没跑时，把上一轮的值接住。
- *
- * 两种情形，语义不同，所以分成两档：
- *
- *   · `force = false`（这一轮的来源排名**不低于**上一轮）：
- *     只补空 —— 本轮跑过的来源说「这里是 null」是有效信息，但没说的地方别丢。
- *
- *   · `force = true`（上一轮有**排名更高**的来源，而它这一轮没跑）：
- *     字段级以**上一轮**为准。理由：高排名来源（直读 GitHub）与低排名来源
- *     （第三方转述）本来就常常给出不同的值，让低排名的那份去覆盖高排名的那份，
- *     换来的不是「更新」而是「来回横跳」—— 每跑一次离线就翻一次，而且没有提示。
- *
- * ★ 拿不到就是 null 这条规矩，针对的是「**去看过**但没看到」，不是「压根没去看」。
- *   少了这一档，一次 `--offline`（或某一路被限流）就会把几千条记录的
- *   语言、topic、许可、star 数悄悄改写成另一份来源的版本。
- */
-function carryForward(rec, prev, { force }) {
-  const out = { ...rec };
-  for (const key of CARRY_FIELDS) {
-    const value = out[key];
-    const empty = value === null || value === undefined || (Array.isArray(value) && value.length === 0);
-    if (!empty && !force) continue;
-    if (prev[key] !== null && prev[key] !== undefined) out[key] = prev[key];
-  }
-  if ((force || !out.archived) && prev.archived) out.archived = true;
-  return out;
-}
-
-function reconcile(fresh, existing, { failedSources, ranSources, keepAll = false } = {}) {
-  const stamp = now();
-  const records = [];
-  const stats = { added: 0, updated: 0, kept: 0, removed: 0, unseen: 0 };
-
-  for (const [id, rec] of fresh) {
-    const prev = existing.get(id);
-    if (!prev) {
-      records.push({ ...rec, firstSeenAt: rec.firstSeenAt ?? stamp, lastSyncedAt: rec.lastSyncedAt ?? stamp });
-      stats.added += 1;
-      continue;
-    }
-
-    /*
-     * ★ 来源只会累积，不会因为「这一路这轮没跑」而被抹掉。
-     *
-     *   一个来源这一轮**跑过**却没产出这个仓库，说明它确实不再知道它了，
-     *   去掉是对的；但这一轮**没跑**（离线、失败、没缓存）时去掉，
-     *   就是把「没去看」当成了「不在了」—— 索引会一轮比一轮差，且毫无提示。
-     */
-    const stillClaimed = (prev.sources ?? []).filter((s) => !ranSources.has(s));
-    // 上一轮有排名更高的来源、而它这一轮没跑 → 本轮无权改写它的字段值
-    const force = stillClaimed.length > 0 && sourceRank(prev) > sourceRank(rec);
-    const merged = stillClaimed.length === 0
-      ? rec
-      : carryForward(
-        { ...rec, sources: [...new Set([...(rec.sources ?? []), ...stillClaimed])].sort() },
-        prev,
-        { force },
-      );
-
-    if (contentEquals(recordContent(prev), recordContent(merged))) {
-      records.push({ ...merged, firstSeenAt: prev.firstSeenAt, lastSyncedAt: prev.lastSyncedAt });
-      stats.kept += 1;
-    } else {
-      records.push({ ...merged, firstSeenAt: prev.firstSeenAt ?? stamp, lastSyncedAt: stamp });
-      stats.updated += 1;
-    }
-  }
-
-  // 这一轮没被任何来源看到、但上一轮在索引里的记录
-  const unseen = [];
-  for (const [id, prev] of existing) {
-    if (fresh.has(id)) continue;
-    // ★ 产生过它的来源这一轮失败了 → 我们**没有看过**，不能当成不存在
-    const sourcesFailed = (prev.sources ?? []).some((s) => failedSources.has(s));
-    const age = prev.lastSyncedAt ? Date.now() - Date.parse(prev.lastSyncedAt) : Infinity;
-    if (keepAll || sourcesFailed || age < STALE_MS) {
-      records.push(prev);
-      stats.unseen += 1;
-      unseen.push(id);
-    } else {
-      stats.removed += 1;
-    }
-  }
-
-  return { records, stats, unseen };
-}
-
 // ─────────────────────────────────────────────────────────────
 // 主流程
 // ─────────────────────────────────────────────────────────────
 
+/**
+ * `--only`：直读一个仓库（REST，单次请求，没有 token 也能跑）。
+ *
+ * ★ 键用 GitHub 返回的**规范名**，不用入参：仓库或账号改名后，入参是个会
+ *   重定向的旧名字，硬写回去会让索引继续停在旧 id 上。
+ */
+async function readOneRepo(id) {
+  const token = githubToken();
+  const headers = { accept: 'application/vnd.github+json', 'user-agent': 'dsh-plugins-collector' };
+  if (token) headers.authorization = `Bearer ${token}`;
+  try {
+    const res = await fetch(`https://api.github.com/repos/${id}`, { headers, signal: AbortSignal.timeout(30_000) });
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    const rec = repoFromSearchItem(await res.json());
+    return rec ? new Map([[rec.id, rec]]) : new Map();
+  } catch (err) {
+    fail(`读取 ${id} 失败：${err?.message ?? err}`);
+    return new Map();
+  }
+}
+
 async function collect() {
-  const { map: existing } = loadExistingIndex();
+  const { map: loadedExisting } = loadExistingIndex();
+  let existing = loadedExisting;
   const seed = loadSeed();
 
   log(`  已有索引 ${existing.size} 条${CHECK_ONLY ? '（校验模式）' : ''}`);
@@ -523,21 +611,7 @@ async function collect() {
   if (ONLY) {
     // --only：只处理一个仓库，其余记录原样继承（手工补录用）
     log(`→ 只处理 ${ONLY}`);
-    const single = OFFLINE ? new Map() : await (async () => {
-      const token = githubToken();
-      const headers = { accept: 'application/vnd.github+json', 'user-agent': 'dsh-plugins-collector' };
-      if (token) headers.authorization = `Bearer ${token}`;
-      try {
-        const res = await fetch(`https://api.github.com/repos/${ONLY}`, { headers, signal: AbortSignal.timeout(30_000) });
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        const item = await res.json();
-        const rec = repoFromSearchItem({ ...item, full_name: ONLY });
-        return rec ? new Map([[rec.id, rec]]) : new Map();
-      } catch (err) {
-        fail(`读取 ${ONLY} 失败：${err?.message ?? err}`);
-        return new Map();
-      }
-    })();
+    const single = OFFLINE ? new Map() : await readOneRepo(ONLY);
     sources.push({ kind: 'github-search', label: SOURCE_LABELS['github-search'], url: `https://github.com/${ONLY}`, records: single, failed: single.size === 0 });
   } else {
     sources.push(await collectFromGithubSearch());
@@ -545,17 +619,48 @@ async function collect() {
     sources.push(await collectFromPublicIndex());
   }
 
-  const failedSources = new Set(sources.filter((s) => s.failed).map((s) => s.kind));
-  /** 这一轮**真的看过**的来源 —— 只有它们才有资格「撤销」一条记录的来源标注 */
-  const ranSources = new Set(sources.filter((s) => !s.failed).map((s) => s.kind));
-  const fresh = mergeAll(sources);
+  let fresh = mergeAll(sources);
 
   // 手工排除：无论哪一路发现它，都不进索引
   for (const id of seed.exclude) fresh.delete(id);
 
-  const { records, stats, unseen } = reconcile(fresh, existing, {
+  /*
+   * ④ 点名直读 —— 放在最后，因为它是对「已经知道的项目」的最终确认：
+   *    搜索/公开索引只回答「有哪些项目」，只有这里回答「它们现在多少星、最近哪天推的」。
+   *
+   * ★ 排班（默认只刷 1/4）：CI 的 GITHUB_TOKEN 只有 1,000 点/小时，整份目录
+   *   一轮刷不完；没排到的记录由 reconcile 原样保留，不会丢、也不会被旧值覆盖。
+   */
+  if (!OFFLINE) {
+    const refreshIds = ONLY
+      ? [ONLY]
+      : [...new Set([...existing.keys(), ...fresh.keys()])].filter((id) => !seed.exclude.has(id));
+    const refresh = await collectFromGithubRepos(refreshIds, {
+      token: githubToken(),
+      rotation: ONLY ? 1 : REFRESH_ROTATION_ARG,
+      priority: ONLY ? [ONLY] : [...new Set([...fresh.keys()].filter((id) => !existing.has(id)), ...seed.include)],
+    });
+    sources.push(refresh);
+    ({ fresh, existing } = applyRepoRefresh(fresh, existing, refresh));
+  }
+
+  const failedSources = new Set(sources.filter((s) => s.failed).map((s) => s.kind));
+  /** 这一轮**真的跑完**的来源 —— 只有它们才有资格「撤销」一条记录的来源标注 */
+  const ranSources = new Set(sources.filter((s) => !s.failed).map((s) => s.kind));
+  /**
+   * 来源 → 本轮「跑了，但没轮到这个仓库」的集合。
+   * 对这些仓库，该来源仍按「没跑」处理 —— 否则排班就会让上一轮的直读值
+   * 被第三方转述的旧值顶掉，面板上的 star 数开始来回横跳。
+   */
+  const unseenBy = new Map();
+  for (const s of sources) {
+    if (s.partial && s.skipped && s.skipped.size > 0) unseenBy.set(s.kind, s.skipped);
+  }
+
+  const { records, stats } = reconcile(fresh, existing, {
     failedSources,
     ranSources,
+    unseenBy,
     keepAll: Boolean(ONLY),
   });
 
@@ -565,6 +670,8 @@ async function collect() {
     url: s.url,
     found: s.records.size,
     failed: s.failed,
+    ...(s.partial ? { partial: true } : {}),
+    ...(s.planned ? { planned: s.planned, covered: s.checked ? s.checked.size : 0, skipped: s.skipped ? s.skipped.size : 0 } : {}),
     ...(s.queries ? { queries: s.queries } : {}),
     ...(s.error ? { error: s.error } : {}),
   }));
@@ -584,6 +691,10 @@ async function collect() {
   log(`  索引共 ${next.plugins.length} 条（star 最高 ${next.plugins[0]?.id ?? '—'} / ${next.plugins[0]?.stars ?? '—'}）`);
   if (failedSources.size > 0) {
     warn(`  ! 本轮有来源不完整（${[...failedSources].join('、')}）—— 由它们发现的记录一律保留，不做删除。`);
+  }
+  const partial = sources.filter((s) => s.partial && !s.failed && s.skipped);
+  if (partial.length > 0) {
+    log(`  这一轮只覆盖了一部分：${partial.map((s) => `${s.label} ${s.checked.size}/${s.checked.size + s.skipped.size}`).join('、')}（没刷到的记录保留上一轮的值）`);
   }
 
   if (LIMIT > 0) {

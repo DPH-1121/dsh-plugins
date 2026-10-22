@@ -12,6 +12,7 @@ import path from 'node:path';
 import { createHash } from 'node:crypto';
 import { fileURLToPath } from 'node:url';
 import { test, eq, ok } from './harness.mjs';
+import { SOURCE_LABELS } from '../scripts/lib/catalog-format.mjs';
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const INDEX = path.join(ROOT, 'catalog', 'index.json');
@@ -79,9 +80,35 @@ test('索引里没有重复仓库，且每条都有可用的仓库地址', () =>
   ok(doc.plugins.every((p) => p.url === `https://github.com/${p.id}`), 'url 必须能由 id 直接推出');
 });
 
+test('来源标记只能是已知的四个值（写错一个字母，排班就把这条记录当成没看过）', () => {
+  const doc = JSON.parse(fs.readFileSync(INDEX, 'utf8'));
+  const known = new Set(Object.keys(SOURCE_LABELS));
+  const bad = [];
+  for (const p of doc.plugins) {
+    for (const s of p.sources ?? []) if (!known.has(s)) bad.push(`${p.id} → ${s}`);
+  }
+  eq(bad.length, 0, `未知来源：${bad.slice(0, 5).join('、')}`);
+
+  // 直读是 star 数与最近推送的唯一权威来源：它一旦整路失灵，索引里应该看得出来
+  const covered = doc.plugins.filter((p) => (p.sources ?? []).includes('github-repo')).length;
+  ok(covered > 0, '没有任何记录带 github-repo —— 直读这一路根本没跑');
+});
+
+test('每条记录的时间戳都是 ISO，star 是非负整数', () => {
+  const doc = JSON.parse(fs.readFileSync(INDEX, 'utf8'));
+  const bad = [];
+  for (const p of doc.plugins) {
+    if (p.stars !== null && (!Number.isInteger(p.stars) || p.stars < 0)) bad.push(`${p.id} stars=${p.stars}`);
+    if (p.pushedAt !== null && Number.isNaN(Date.parse(p.pushedAt))) bad.push(`${p.id} pushedAt=${p.pushedAt}`);
+  }
+  eq(bad.length, 0, `字段类型不对：${bad.slice(0, 5).join('、')}`);
+});
+
 test('包内快照的体积受控（它是随包安装的，不能无限长）', () => {
   const size = fs.statSync(SNAPSHOT).size;
-  ok(size < 12_000_000, `快照 ${size} 字节，太大了 —— 它会被打进插件包`);
+  // 上限与 .github/workflows/verify.yml 一致（16MB）：这是数据文件的上限，
+  // 不是发给浏览器的 payload —— 面板拿到的是服务器半裁过的列式投影。
+  ok(size < 16_000_000, `快照 ${size} 字节，太大了 —— 它会被打进插件包`);
   const doc = JSON.parse(fs.readFileSync(SNAPSHOT, 'utf8'));
   const index = JSON.parse(fs.readFileSync(INDEX, 'utf8'));
   eq(doc.plugins.length, index.plugins.length, '快照必须包含完整目录');

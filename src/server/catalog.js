@@ -31,8 +31,8 @@ import path from 'node:path';
 import { ensureDir, pluginDir, readJsonSafe, resolveDataDir, writeJsonAtomic } from './util.js';
 
 /** 本仓库的 raw 地址：索引从这里取 */
-export const REPO_RAW_BASE = 'https://raw.githubusercontent.com/HaydenSmith1121/dsh-plugins/main';
-export const REPO_HOMEPAGE = 'https://github.com/HaydenSmith1121/dsh-plugins';
+export const REPO_RAW_BASE = 'https://raw.githubusercontent.com/DPH-1121/dsh-plugins/main';
+export const REPO_HOMEPAGE = 'https://github.com/DPH-1121/dsh-plugins';
 export const REPO_INDEX_URL = `${REPO_RAW_BASE}/catalog/index.json`;
 
 /**

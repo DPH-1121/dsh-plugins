@@ -8,7 +8,7 @@
 import { test, eq, ok, deepEq } from './harness.mjs';
 import {
   buildIndex, buildSnapshot, contentEquals, indexContent, mergeRecords,
-  normalizeRecord, recordContent, serializeIndex, sortRecords, toRepoId,
+  normalizeGraphqlRepo, normalizeRecord, recordContent, serializeIndex, sortRecords, toRepoId,
 } from '../scripts/lib/catalog-format.mjs';
 
 test('toRepoId：各种写法都能归一，不合法的一律返回 null', () => {
@@ -47,6 +47,39 @@ test('normalizeRecord：字段归一 + 键顺序固定', () => {
     'stars', 'forks', 'language', 'topics', 'license', 'homepage',
     'pushedAt', 'archived', 'sources', 'firstSeenAt', 'lastSyncedAt',
   ], '键顺序是序列化确定性的一部分，改动等于让整份索引重排');
+});
+
+test('normalizeGraphqlRepo：GraphQL 节点 → 规范记录（含改名要用的 nameWithOwner）', () => {
+  const rec = normalizeGraphqlRepo({
+    nameWithOwner: 'NewOwner/Repo',
+    stargazerCount: 7,
+    forkCount: 2,
+    description: '  hello   world  ',
+    primaryLanguage: { name: 'TypeScript' },
+    repositoryTopics: {
+      nodes: [{ topic: { name: 'Dsh-Plugin' } }, { topic: null }, { topic: { name: '' } }],
+    },
+    licenseInfo: { spdxId: 'MIT' },
+    homepageUrl: 'https://example.com',
+    pushedAt: '2026-10-19T06:46:08Z',
+    isArchived: true,
+  });
+  eq(rec.id, 'NewOwner/Repo', '★ 必须用 nameWithOwner：改名后只有它知道仓库现在叫什么');
+  eq(rec.stars, 7);
+  eq(rec.forks, 2);
+  eq(rec.description, 'hello world');
+  eq(rec.language, 'TypeScript');
+  deepEq(rec.topics, ['dsh-plugin']);
+  eq(rec.license, 'MIT');
+  eq(rec.homepage, 'https://example.com');
+  eq(rec.pushedAt, '2026-10-19T06:46:08.000Z');
+  eq(rec.archived, true);
+  deepEq(rec.sources, ['github-repo']);
+
+  eq(normalizeGraphqlRepo({ nameWithOwner: 'a/b', licenseInfo: { spdxId: 'NOASSERTION' } }).license, null,
+    'NOASSERTION 表示「有许可文件但认不出来」，不是 SPDX 标识');
+  eq(normalizeGraphqlRepo({ stargazerCount: 1 }), null, '没有 nameWithOwner 就不是一个仓库');
+  eq(normalizeGraphqlRepo(null), null);
 });
 
 test('mergeRecords：来源排名高的采信，sources 取并集', () => {

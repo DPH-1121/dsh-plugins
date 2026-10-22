@@ -2,6 +2,8 @@
   <img src="assets/hero-everything-is-a-plugin.svg" alt="万物皆插件 — Everything is a plugin：模型、工具、界面、工作流经同一套 contract 组合进同一个 DeepSeek Harness 运行时" width="100%">
 </p>
 
+1.2.0：**修好「更新时间与 star 数对不上」** —— 新增 GitHub 点名直读（GraphQL）：按 `owner/repo`、每 6 小时把整份目录刷一遍，仓库改名也会把索引里的 id 一起迁正。此前只有搜索命中的前 1000 条会被更新，其余记录会永远停在第一次采集的数字上。
+
 1.1.0：搜索框旁可切换「相关度（默认）」「Star 从高到低」「Star 从低到高」。搜索支持包含匹配、名称缩写（如 `dshmem`）及常见拼写误差（如 `memroy` → `memory`）；精确匹配优先，多个词需同时匹配。未输入关键词时，Star 排序作用于整个目录。
 
 <p align="center">
@@ -64,7 +66,7 @@
 **设置 → 插件 → 添加插件**，填：
 
 ```
-github:HaydenSmith1121/dsh-plugins
+github:DPH-1121/dsh-plugins
 ```
 
 装完重启，左侧导航出现「插件搜集」。
@@ -78,7 +80,7 @@ github:HaydenSmith1121/dsh-plugins
 ### 命令行 dsh
 
 ```bash
-dsh plugin --profile web add github:HaydenSmith1121/dsh-plugins
+dsh plugin --profile web add github:DPH-1121/dsh-plugins
 ```
 
 <details>
@@ -137,7 +139,7 @@ dsh plugin --profile web add github:HaydenSmith1121/dsh-plugins
 | 做法 | 效果 |
 |---|---|
 | 索引**一次取全量**（列式压缩 + gzip） | 打开面板一次传输，之后搜索不再有网络往返 |
-| **本地建索引 + 本地检索** | 九千多条记录的检索在 10ms 量级 |
+| **本地建索引 + 本地检索** | 一万四千多条记录的检索在 10ms 量级 |
 | **虚拟滚动**（只渲染视口里的十几行） | 滚动不掉帧，行数再多也一样 |
 | **模块级缓存** | 面板切走再切回来是瞬时的，不重新取数 |
 | **服务端条件请求 + 30 分钟 TTL** | 「刷新」通常只是一次 304 |
@@ -153,9 +155,16 @@ dsh plugin --profile web add github:HaydenSmith1121/dsh-plugins
 
 | 来源 | 作用 | 说明 |
 |---|---|---|
-| **GitHub 搜索** | 主力 | 按 `topic:dsh-plugin`、`topic:deepseek-harness` 等 topic 与关键词检索，**一次拿 100 个完整仓库对象** —— 描述、作者、star 数、语言、topic、许可全在里面 |
+| **GitHub 搜索** | 发现 | 按 `topic:dsh-plugin`、`topic:deepseek-harness` 等 topic 与关键词检索，**一次拿 100 个完整仓库对象** —— 描述、作者、star 数、语言、topic、许可全在里面 |
+| **GitHub 直读** | 保鲜 | 按 `owner/repo` 点名批量取（GraphQL），**把已知项目的 star 数与最近推送刷准**；仓库改名也由它带回规范名。默认每 6 小时全刷一遍（约 152 次请求、并发 4），一条记录最多滞后 6 小时 |
 | **公开索引** | 兜底 | 第三方维护的 DSH 插件清单，覆盖大量没打 topic、搜不到的仓库 |
 | **[`catalog/seed.json`](./catalog/seed.json)** | 人工 | 两者都漏掉的写进 `include`；作者要求下架的写进 `exclude` |
+
+> ★ **为什么「搜索」之外还要「直读」。**
+> 搜索接口每个查询最多只翻到 1000 条结果，而目录里有一万四千多个仓库 ——
+> 只靠搜索，绝大多数项目的 star 数与最近推送会**永远停在第一次被采集的那天**，
+> 面板上看起来就是「更新于 23 天前」和一个再也不会动的星数。
+> 直读按名字点名，没有这个可见性上限；顺带把改名后的仓库 id 一起迁正。
 
 > ★ **为什么是「多个窄查询」而不是「一个宽查询翻到底」。**
 > GitHub 搜索接口每个查询最多返回 1000 条，认证后每分钟只有 30 次请求。
@@ -167,7 +176,7 @@ dsh plugin --profile web add github:HaydenSmith1121/dsh-plugins
 | 规矩 | 为什么 |
 |---|---|
 | **内容没变就不动时间戳** | 每 6 小时一次的无脑刷新会让几千条记录天天显示为「已修改」，真正的变更被噪音淹没 |
-| **没看过就不删** | 某个来源这一轮失败了（限流、断网），由它发现的记录**原样保留**。把「没查到」当成「不存在」是这类采集器最容易犯的错 |
+| **没看过就不删、也别改** | 某个来源这一轮失败了（限流、断网）或按排班没轮到某个仓库，它给出的值**原样保留**。把「没查到」当成「不存在」是这类采集器最容易犯的错 |
 | **输出逐字节确定** | 同输入必得同字节：排序规则固定、键顺序固定、时间戳只在内容真的变了时推进 |
 
 本地怎么跑：
@@ -178,6 +187,7 @@ node scripts/collect.mjs --check    # 只读校验：不联网、不写盘
 node scripts/collect.mjs --offline  # 用 .cache/ 里上一轮的原始数据重跑
 node scripts/collect.mjs --only owner/repo   # 只处理一个仓库
 node scripts/collect.mjs --limit 200         # 试跑，不写盘
+node scripts/collect.mjs --refresh-all       # 本轮直读全部仓库（个人 token 才够配额）
 ```
 
 ---

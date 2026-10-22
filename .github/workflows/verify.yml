@@ -59,13 +59,16 @@ jobs:
           idx=$(stat -c%s catalog/index.json)
           snap=$(stat -c%s catalog/snapshot.json)
           echo "index.json = $idx 字节，snapshot.json = $snap 字节"
-          # 面板一次取全量索引，所以它有硬上限：超过 12MB 说明采集面失控了
-          if [ "$idx" -gt 12000000 ]; then
-            echo "::error::catalog/index.json 超过 12MB —— 面板要整份取走它，请先收窄采集范围。"
+          # 上限 16MB：这个文件是**数据**，不是发给浏览器的 payload ——
+          # 面板实际收到的是服务器半裁过的列式投影（约 1.6MB JSON / 700KB gzip）。
+          # 16MB 是「采集面失控」的警报线，不是精确预算：目录已到一万五千个项目，
+          # 旧线（12MB）在 2026-10 就被正常的覆盖面增长顶穿了。
+          if [ "$idx" -gt 16000000 ]; then
+            echo "::error::catalog/index.json 超过 16MB —— 采集面失控了，请先收窄采集范围。"
             exit 1
           fi
-          if [ "$snap" -gt 12000000 ]; then
-            echo "::error::catalog/snapshot.json 超过 12MB —— 完整离线目录仍需控制体积。"
+          if [ "$snap" -gt 16000000 ]; then
+            echo "::error::catalog/snapshot.json 超过 16MB —— 完整离线目录仍需控制体积。"
             exit 1
           fi
 

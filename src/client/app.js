@@ -50,7 +50,7 @@ window.__ModuleLoader__.load({
 		var PANEL_ID = "dsh-plugins-market";
 		var PANEL_LABEL = "插件搜集";
 		var API_PATH = "/dsh-plugins-market/api";
-		var REPO_HOMEPAGE = "https://github.com/HaydenSmith1121/dsh-plugins";
+		var REPO_HOMEPAGE = "https://github.com/DPH-1121/dsh-plugins";
 		/** 行高必须与 CSS 里的 .dpm-row 高度一致 —— 虚拟滚动靠它算位置 */
 		var ROW_H = 96;
 		/** 视口上下各多渲染几行，滚动时不会看见空白 */
@@ -612,7 +612,10 @@ window.__ModuleLoader__.load({
 						{ className: "dpm-meta" },
 						row[C.lang] ? h(Chip, { dim: true }, row[C.lang]) : null,
 						topics.map(function (t) { return h(Chip, { key: t, dim: true, title: "topic: " + t }, t); }),
-						pushed ? h("span", null, "更新于 " + pushed) : null,
+						pushed
+							? h("span", { title: row[C.pushedAt] ? "GitHub 最近推送：" + row[C.pushedAt] : undefined },
+								"更新于 " + pushed)
+							: null,
 						row[C.license] ? h("span", null, row[C.license]) : null,
 					),
 				),
@@ -705,12 +708,17 @@ window.__ModuleLoader__.load({
 						}),
 						h("p", { className: "dpm-note" },
 							"索引由 GitHub Actions 定时重采（", h("code", null, "scripts/collect.mjs"),
-							"）：先按 topic / 关键词在 GitHub 上搜插件仓库，再用公开索引补上搜不到的部分。",
-							"这里只记录公开事实 —— 项目描述、仓库地址、作者、star 数。"),
+							"）：先按 topic / 关键词在 GitHub 上搜插件仓库（负责发现），",
+							"再按 ", h("code", null, "owner/repo"), " 点名直读、把 star 数与最近推送刷准（负责保鲜），",
+							"最后用公开索引补上搜不到的部分。直读每 6 小时整份刷一遍，所以任意一条记录的",
+							"星数与推送时间最多滞后 6 小时。这里只记录公开事实 —— 项目描述、仓库地址、作者、star 数。"),
 						props.meta && props.meta.sources && props.meta.sources.length > 0
 							? h("p", { className: "dpm-note" },
 								"来源：" + props.meta.sources.map(function (s) {
-									return s.label + "（" + s.found + " 条" + (s.failed ? "，本轮失败" : "") + "）";
+									var coverage = s.partial && typeof s.covered === "number"
+										? "，本轮覆盖 " + s.covered + "/" + (s.covered + (s.skipped || 0))
+										: "";
+									return s.label + "（" + s.found + " 条" + (s.failed ? "，本轮失败" : coverage) + "）";
 								}).join(" · "))
 							: null,
 						props.meta && props.meta.error ? h("div", { className: "dpm-err" }, props.meta.error) : null,
