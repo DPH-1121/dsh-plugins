@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugins-market",
-  "version": "1.2.0",
+  "version": "1.2.1",
   "private": true,
   "type": "module",
   "description": "DSH 插件项目搜集面板：搜集 GitHub 上的 DeepSeek Harness 插件仓库，展示项目描述、仓库地址、作者与 star 数；安装交给官方桌面版自带的「从 GitHub 安装插件」。",

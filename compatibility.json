@@ -18,7 +18,7 @@
     "  broken      实测不可用（会写清楚坏在哪一步）"
   ],
   "schemaVersion": 2,
-  "updated": "2026-10-19",
+  "updated": "2026-10-25",
   "policy": {
     "peerDependencies": "none",
     "note": "本包不声明任何 dependencies / peerDependencies。dsh 0.1.7 起会在导入插件前核对 peer 里 @deepseek-ai/dsh* 与运行时版本是否一致 —— 写了 peer 就等于把自己钉死在一个版本上。"
@@ -36,6 +36,17 @@
   },
   "runtimes": [
     {
+      "dshVersion": "0.2.1-rc.3",
+      "channel": "cli",
+      "status": "supported",
+      "verifiedAt": "2026-10-25",
+      "verifiedOn": {
+        "os": "Windows",
+        "node": "24.18.0",
+        "pnpm": "12.4.2",
+        "result": "隔离 DSH_HOME 里用 0.2.1-rc.3 的 npm 包树（dsh/lib/bin.js）启动 web profile：插件连同 dsh-base / dsh-web-app 一起装载，启动无「entry did not activate」告警。host 侧 POST /dsh-plugins-market/api 的 status 返回 200（harness.version=0.2.1-rc.3、matchReason=same-line），index 返回 200、4,927,526 字节；客户端半在启动图里是 dsh-plugins-market/client.js，按图取回 2,068,471 字节。本仓 119 项测试全过。"
+      }
+    },    {
       "dshVersion": "0.2.1-rc.2",
       "channel": "next",
       "status": "supported",
